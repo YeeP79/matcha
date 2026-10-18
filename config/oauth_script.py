@@ -118,7 +118,7 @@ def save_tokens(email, tokens):
 
 
 def client_credentials_file_for(provider):
-    """Return the client credentials file path for a given provider."""
+    """Return the provider-default client credentials file path."""
     home = os.path.expanduser("~")
     if provider == "gmail":
         # Keep backwards-compatible path for Gmail
@@ -126,30 +126,65 @@ def client_credentials_file_for(provider):
     return os.path.join(home, ".config", "matcha", f"oauth_client_{provider}.json")
 
 
-def load_client_credentials(provider):
-    """Load OAuth2 client credentials for the given provider."""
-    path = client_credentials_file_for(provider)
+def client_credentials_file_for_email(email):
+    """Return the per-account client credentials file path.
+
+    Workspace and other custom-domain accounts often need an OAuth Client from a
+    different Cloud Project than personal accounts; storing creds per-email lets
+    them coexist with the shared provider default.
+    """
+    safe_name = hashlib.sha256(email.encode()).hexdigest()[:16]
+    return os.path.join(get_token_dir(), f"{safe_name}.client.json")
+
+
+def _read_credentials_file(path):
     if not os.path.exists(path):
-        # Also try the generic path as fallback
-        home = os.path.expanduser("~")
-        generic = os.path.join(home, ".config", "matcha", "oauth_client.json")
-        if provider != "gmail" and os.path.exists(generic):
-            with open(generic, "r") as f:
-                data = json.load(f)
-            # Only use generic if it has provider-specific keys
-            pid = data.get("provider")
-            if pid == provider:
-                return data.get("client_id"), data.get("client_secret")
-        if not os.path.exists(path):
-            return None, None
+        return None, None
     with open(path, "r") as f:
         data = json.load(f)
     return data.get("client_id"), data.get("client_secret")
 
 
+def load_client_credentials(provider):
+    """Load the provider-default OAuth2 client credentials."""
+    cid, secret = _read_credentials_file(client_credentials_file_for(provider))
+    if cid and secret:
+        return cid, secret
+    # Backwards-compat: generic file with explicit provider tag
+    if provider != "gmail":
+        home = os.path.expanduser("~")
+        generic = os.path.join(home, ".config", "matcha", "oauth_client.json")
+        if os.path.exists(generic):
+            with open(generic, "r") as f:
+                data = json.load(f)
+            if data.get("provider") == provider:
+                return data.get("client_id"), data.get("client_secret")
+    return None, None
+
+
+def load_client_for_account(email, provider):
+    """Load credentials for a specific account, falling back to the provider default.
+
+    Per-account overrides let a personal Gmail and a Workspace Gmail use OAuth
+    Clients from different Cloud Projects.
+    """
+    cid, secret = _read_credentials_file(client_credentials_file_for_email(email))
+    if cid and secret:
+        return cid, secret
+    return load_client_credentials(provider)
+
+
 def save_client_credentials(provider, client_id, client_secret):
-    """Save OAuth2 client credentials for the given provider."""
+    """Save the provider-default OAuth2 client credentials."""
     path = client_credentials_file_for(provider)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"client_id": client_id, "client_secret": client_secret}, f, indent=2)
+
+
+def save_client_credentials_for_email(email, client_id, client_secret):
+    """Save OAuth2 client credentials scoped to a specific account."""
+    path = client_credentials_file_for_email(email)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump({"client_id": client_id, "client_secret": client_secret}, f, indent=2)
@@ -286,8 +321,14 @@ def detect_provider(email):
     return None
 
 
-def do_auth(email, provider, client_id, client_secret):
-    """Run the full OAuth2 authorization flow."""
+def do_auth(email, provider, client_id, client_secret, explicit_credentials):
+    """Run the full OAuth2 authorization flow.
+
+    explicit_credentials is True when the caller passed --client-id/--client-secret
+    on this invocation. Explicit creds are saved as a per-account override so
+    Workspace accounts can use a different OAuth Client than the shared default;
+    the provider default is seeded only when it isn't already set.
+    """
     cfg = PROVIDERS[provider]
     state = secrets.token_urlsafe(32)
 
@@ -348,7 +389,17 @@ def do_auth(email, provider, client_id, client_secret):
     }
 
     save_tokens(email, tokens)
-    save_client_credentials(provider, client_id, client_secret)
+    if explicit_credentials:
+        # Per-account override: don't disturb the shared provider default.
+        save_client_credentials_for_email(email, client_id, client_secret)
+        # Seed the provider default on first auth so additional accounts can
+        # omit --client-id/--client-secret. Never overwrite an existing default.
+        existing_id, existing_secret = load_client_credentials(provider)
+        if not existing_id or not existing_secret:
+            save_client_credentials(provider, client_id, client_secret)
+    else:
+        # Credentials came from the provider default file; nothing new to store.
+        pass
 
     print("Authorization complete! Tokens saved.", file=sys.stderr)
     # Print the access token to stdout for immediate use
@@ -366,7 +417,7 @@ def do_token(email):
 
     # Check if token is expired (with 5 minute buffer)
     if time.time() >= tokens.get("expires_at", 0) - 300:
-        client_id, client_secret = load_client_credentials(provider)
+        client_id, client_secret = load_client_for_account(email, provider)
         if not client_id or not client_secret:
             print("No client credentials found. Run 'auth' first.", file=sys.stderr)
             sys.exit(1)
@@ -416,6 +467,11 @@ def do_revoke(email):
     if os.path.exists(path):
         os.remove(path)
 
+    # Delete any per-account client credential override
+    cred_path = client_credentials_file_for_email(email)
+    if os.path.exists(cred_path):
+        os.remove(cred_path)
+
     if revoked:
         print("Token revoked and deleted.", file=sys.stderr)
     else:
@@ -462,10 +518,13 @@ def main():
 
         client_id = args.client_id
         client_secret = args.client_secret
+        explicit_credentials = bool(client_id and client_secret)
 
-        # Fall back to stored credentials
+        # Fall back to stored credentials: per-account override first, then
+        # provider default. Workspace accounts with their own OAuth Client
+        # remain isolated from the shared default this way.
         if not client_id or not client_secret:
-            client_id, client_secret = load_client_credentials(provider)
+            client_id, client_secret = load_client_for_account(args.email, provider)
 
         if not client_id or not client_secret:
             cfg = PROVIDERS[provider]
@@ -485,7 +544,7 @@ def main():
             )
             sys.exit(1)
 
-        do_auth(args.email, provider, client_id, client_secret)
+        do_auth(args.email, provider, client_id, client_secret, explicit_credentials)
 
     elif args.command == "token":
         do_token(args.email)

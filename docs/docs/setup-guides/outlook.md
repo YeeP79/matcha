@@ -100,6 +100,38 @@ Or, if you don't want to create the JSON file, run with inline credentials:
 matcha oauth auth your@outlook.com --provider outlook --client-id YOUR_ID --client-secret YOUR_SECRET
 ```
 
+### Authorizing additional Outlook accounts (including Microsoft 365)
+
+Matcha supports multiple Microsoft accounts in two configurations: **shared Entra app** (one App registration authorizes many users) and **per-account override** (different App registrations for accounts that live in different **Microsoft Entra tenants**).
+
+#### Shared Entra app (one App registration, many users)
+
+A single **App registration** in one Entra tenant can authorize any number of Microsoft accounts. After your first `oauth auth` call, the Application (client) ID and client secret are saved as the **provider default**. Additional accounts can omit the flags:
+
+```bash
+matcha oauth auth second.account@outlook.com --provider outlook
+```
+
+The `--provider outlook` flag is required for any address whose domain doesn't auto-detect (anything other than `@outlook.com`, `@hotmail.com`, `@live.com`, `@msn.com`).
+
+#### Per-account override (multiple Entra tenants)
+
+When two accounts live in different Entra tenants — for example, a personal Outlook account and a work Microsoft 365 mailbox where IT controls a separate tenant — each account needs its own App registration. Create the second App registration in the appropriate tenant (with the same `IMAP.AccessAsUser.All`, `SMTP.Send`, `offline_access` scopes), then authorize:
+
+```bash
+# Personal Outlook uses the default App registration (saved on first auth)
+matcha oauth auth you@outlook.com --provider outlook \
+  --client-id PERSONAL_ENTRA_CLIENT_ID --client-secret PERSONAL_SECRET
+
+# Work mailbox uses a separate App registration in your employer's tenant
+matcha oauth auth you@yourcompany.com --provider outlook \
+  --client-id WORK_ENTRA_CLIENT_ID --client-secret WORK_SECRET
+```
+
+The work credentials are stored as a **per-account override** scoped to that email and don't disturb the provider default.
+
+If your work tenant requires admin consent for third-party app access, the App registration needs to be configured for the right **supported account types** (**Single tenant** for one organization, **Multitenant** if you want one App registration to span multiple Entra tenants), and an admin may need to grant tenant-wide consent for the requested API permissions.
+
 ### Enabling IMAP in Outlook
 
 We are almost ready to connect with Matcha. First, we must enable IMAP access in Outlook if you have not done so already.
